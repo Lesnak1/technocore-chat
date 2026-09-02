@@ -26,6 +26,10 @@ import pathlib
 import sys
 import urllib.request
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
+
+import store  # noqa: E402  — for MAX_LIMIT only; see ROOMS_KEY_MATCH below
+
 # Every route in app.py that renders a document. Deliberately explicit: this list and the
 # `routes` in wrangler.jsonc describe the same surface and are checked against each other
 # by test_edge_snapshot_covers_every_routed_document.
@@ -83,6 +87,47 @@ STATIC_FIRST = {"/skill.md": "SKILL.md", "/patterns.md": "src/patterns.md"}
 # ~1.78M origin requests a day (measured 2026-09-02: 2,478 of 2,480 /healthz requests in two
 # minutes arrived through the tunnel, 10.4% of all traffic).
 EDGE_CACHED = {"/healthz": 10}
+
+# Served from the edge copy ALWAYS, refreshed in the background at most this often. Never
+# snapshotted: like /healthz these are live figures, and a stored answer would outlive the
+# service that produced it.
+#
+# Not because the walk is expensive: bench/rooms.py measures it in the hundreds of
+# milliseconds, less than a tenth of which is what `limit` buys. Against concurrent writers it
+# costs an order of magnitude more at *every* limit, including the one that reads no room
+# tails. The cost is queueing, not work, so no cache window can be made reliably longer than
+# it and walking less does not help. Serving the copy and refreshing behind ctx.waitUntil()
+# is what stops a reader ever paying it.
+#
+# The interval is short because /rooms is activity monitoring: `idle_seconds` and `last_seq`
+# are the payload, and a stale copy misreports exactly what a reader came for. It has a floor
+# rather than a target — test_the_refresh_interval_is_not_faster_than_the_origin_can_answer.
+EDGE_REVALIDATE = {"/rooms": 5}
+
+# What a /rooms cache key is made of. The handler reads only `limit` and `format` and clamps
+# the first, so /rooms?limit=999999999, ?limit=200 and ?limit=200&x=1 are one reply — and a
+# key built from the raw URL stores them as three, letting a caller force a cold walk per
+# request by incrementing a digit. app.py fixed this for its own cache ("the key space is the
+# reply space"); a lane in front of it has to carry the same fix.
+#
+# `match` names a parameter that matters only when it equals one value: `format=json` picks
+# the rendering, every other value is ignored. `clamped` names a numeric one and its bounds.
+#
+# The ceiling comes from the tree, not the served schema, which is the opposite of what this
+# file does elsewhere: `limit` is advisory, so by the input doctrine it publishes no
+# minimum/maximum — bounds mean refusal and this clamps (test_input_doctrine.py asserts their
+# absence). MAX_LIMIT is a constant rather than a knob, so the checkout is an exact source.
+ROOMS_KEY_MATCH = {"format": "json"}
+
+
+def rooms_key() -> dict:
+    """The /rooms cache-key spec, with the ceiling taken from the code being deployed."""
+    return {
+        "/rooms": {
+            "match": dict(ROOMS_KEY_MATCH),
+            "clamped": {"limit": {"min": 1, "max": store.MAX_LIMIT}},
+        }
+    }
 
 
 def asset_name(path: str) -> str:
@@ -144,9 +189,24 @@ def main() -> int:
             print(f"  {line}", file=sys.stderr)
         return 1
 
+    edge_key = rooms_key()
+    unspecified = sorted(set(EDGE_REVALIDATE) - set(edge_key))
+    if unspecified:
+        # Fail closed. Without a key spec the Worker would have to key on the raw URL, which
+        # is the multiplication bug above — a deploy that silently did that is worse than one
+        # that stops here, because nothing downstream would report it.
+        print(f"\nsnapshot FAILED: no cache-key spec for {unspecified}", file=sys.stderr)
+        return 1
+
     pathlib.Path(args.manifest).write_text(
         json.dumps(
-            {"types": types, "static_first": sorted(STATIC_FIRST), "edge_cached": EDGE_CACHED},
+            {
+                "types": types,
+                "static_first": sorted(STATIC_FIRST),
+                "edge_cached": EDGE_CACHED,
+                "edge_revalidate": EDGE_REVALIDATE,
+                "edge_key": edge_key,
+            },
             indent=2,
             sort_keys=True,
         )

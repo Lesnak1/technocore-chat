@@ -17,6 +17,8 @@ import re
 import _client
 import pytest
 
+import store
+
 EDGE = pathlib.Path(__file__).resolve().parents[2] / "edge"
 
 client = _client.client  # the shared TestClient fixture
@@ -57,7 +59,7 @@ def test_every_routed_path_is_either_snapshotted_or_deliberately_not():
     whole point of them.
     """
     snapshot = _snapshot_module()
-    accounted = set(snapshot.PATHS) | set(snapshot.EDGE_CACHED)
+    accounted = set(snapshot.PATHS) | set(snapshot.EDGE_CACHED) | set(snapshot.EDGE_REVALIDATE)
     assert _wrangler_routes() - accounted == set()
 
 
@@ -69,9 +71,11 @@ def test_a_liveness_path_is_never_snapshotted():
     report a service that is gone as healthy, to every monitor watching it.
     """
     snapshot = _snapshot_module()
-    assert set(snapshot.EDGE_CACHED) & set(snapshot.PATHS) == set()
-    assert set(snapshot.EDGE_CACHED) & set(snapshot.STATIC_FIRST) == set()
+    live = set(snapshot.EDGE_CACHED) | set(snapshot.EDGE_REVALIDATE)
+    assert live & set(snapshot.PATHS) == set()
+    assert live & set(snapshot.STATIC_FIRST) == set()
     assert "/healthz" not in snapshot.PATHS
+    assert "/rooms" not in snapshot.PATHS
 
 
 def test_the_edge_cache_window_is_long_enough_to_be_worth_having():
@@ -215,4 +219,134 @@ def test_the_edge_cached_lane_shares_its_copy_only_with_the_edge():
     assert "s-maxage=${seconds}" in worker
     assert "max-age=0, s-maxage=${seconds}" in worker, (
         "the edge-cached copy must not carry a private max-age"
+    )
+
+
+def test_the_revalidating_lane_never_makes_a_reader_wait_for_the_origin():
+    """The property the lane exists for, asserted on the source for want of a JS harness —
+    and the one a later edit would quietly remove. /rooms is an O(total-rooms) walk (#576)
+    whose cost under concurrency is queueing rather than work (bench/rooms.py), so no cache
+    window is reliably longer than it: whoever arrives after one closes pays the whole cost
+    and holds an anyio thread doing it. Returning the copy unconditionally is what breaks it.
+    """
+    worker = (EDGE / "src" / "worker.js").read_text(encoding="utf-8")
+    lane = worker[worker.index("async function revalidating(") :]
+    lane = lane[: lane.index("export default")]
+    assert "return hit;" in lane, "the cached copy must be returned whatever its age"
+    assert "ctx.waitUntil(" in lane, "the refresh must not be awaited on the request path"
+    assert "fill(" in lane, "a burst on one PoP must not queue one walk per reader"
+
+
+def test_the_refresh_interval_is_not_faster_than_the_origin_can_answer(client):
+    """/rooms is activity monitoring, so the interval wants to be short — `idle_seconds` and
+    `last_seq` are the payload and a stale copy misreports them. The floor is the origin's
+    own memo: inside CHAT_ROOMS_CACHE_SECONDS it re-walks nothing and returns what it already
+    has, so refreshing faster than that spends requests for an identical answer.
+    """
+    published = client.get("/config").json()["settings"]["rooms_cache_seconds"]
+    for path, seconds in _snapshot_module().EDGE_REVALIDATE.items():
+        assert seconds >= published, (
+            f"{path} refreshes every {seconds}s, inside the origin's own {published}s window"
+        )
+
+
+def _between(text: str, start: str, end: str) -> str:
+    """One function's source, for the assertions there is no JS harness to make properly."""
+    body = text[text.index(start) :]
+    return body[: body.index(end)]
+
+
+def test_the_cold_fill_is_single_flighted_too():
+    """The refresh was deduplicated from the start and the cold path was not — yet a cold PoP
+    is where a burst costs most, having no copy to serve.
+    """
+    worker = (EDGE / "src" / "worker.js").read_text(encoding="utf-8")
+    lane = _between(worker, "async function revalidating(", "export default")
+    assert "fromOrigin(" not in lane, "the lane must reach the origin only through fill()"
+    cold = lane[lane.index("if (!hit)") :]
+    assert "fill(" in cold[: cold.index("\n")], "the cold path must join the shared fill"
+
+
+def test_a_caller_specific_reply_never_becomes_the_shared_copy():
+    """/rooms carries a budget footer once a caller's read allowance runs low, and the handler
+    keeps that reply out of any shared cache (`return resp if note else _edge_cacheable`).
+    This lane rewrites Cache-Control on what it stores, so without the check it would publish
+    one caller's pacing to every reader of the key.
+    """
+    fill = _between(
+        (EDGE / "src" / "worker.js").read_text(encoding="utf-8"),
+        "async function fromOrigin(",
+        "function fill(",
+    )
+    assert fill.index("no-store") < fill.index("caches.default.put"), (
+        "the no-store check must come before the copy is stored, not after"
+    )
+
+
+def test_the_edge_hold_outlives_a_sustained_refresh_outage():
+    """An expiry reachable while refreshes are failing drops the copy exactly when nothing can
+    replace it, putting the next reader back on the walk. The policy: the copy survives a
+    hundred consecutive failed refreshes.
+    """
+    worker = (EDGE / "src" / "worker.js").read_text(encoding="utf-8")
+    found = re.search(r"EDGE_HOLD_SECONDS = (\d+)", worker)
+    assert found, "the lane must declare how long the edge may hold a copy"
+    hold = int(found.group(1))
+    longest = max(_snapshot_module().EDGE_REVALIDATE.values(), default=0)
+    assert hold >= longest * 100, f"a {hold}s hold does not outlive a {longest}s refresh lapse"
+
+
+def test_every_revalidating_path_has_a_cache_key_spec():
+    """Without one the Worker would have to key on the raw URL, which is the bug below."""
+    snapshot = _snapshot_module()
+    spec = snapshot.rooms_key()
+    assert set(snapshot.EDGE_REVALIDATE) <= set(spec)
+
+
+def test_the_edge_key_is_the_reply_space_and_not_the_url_space(client):
+    """Keyed on the clamped limit, not the raw query string — the bug app.py fixed for its own
+    cache ("?limit=200 and ?limit=1000000 are one reply and were two entries") one layer out.
+    The ceiling comes from store.MAX_LIMIT, so assert it against the handler's real behaviour:
+    if the two ever parted, the edge would serve one caller's row count to another.
+    """
+    rule = _snapshot_module().rooms_key()["/rooms"]
+    limit = rule["clamped"]["limit"]
+    assert limit["max"] == store.MAX_LIMIT
+    assert rule["match"] == {"format": "json"}
+    # The doctrine reason this number comes from the tree and not from the served schema:
+    # an advisory parameter publishes no bounds, because bounds mean refusal and this clamps.
+    schema = client.get("/openapi.json").json()["paths"]["/rooms"]["get"]["parameters"]
+    published = next(p for p in schema if p["name"] == "limit")["schema"]
+    assert "maximum" not in published and "minimum" not in published
+
+    for name in ("edgekey-a", "edgekey-b", "edgekey-c"):
+        client.get(f"/r/{name}/say/nick/hello")
+
+    def listed(query: str) -> list[str]:
+        payload = client.get(f"/rooms?format=json&{query}").json()
+        return [r["room"] for r in payload["rooms"]]
+
+    # Everything at or past the ceiling is one reply, which is what lets the key collapse it.
+    assert listed(f"limit={limit['max']}") == listed(f"limit={limit['max'] * 100000}")
+    # And zero means one, the handler's `or 1` — the edge arithmetic mirrors it exactly.
+    assert listed("limit=0") == listed("limit=1")
+
+
+def test_a_head_request_can_never_become_the_stored_body():
+    """route() admits HEAD and cacheKey() normalises to a GET key, so a fill that fetched the
+    caller's request would store a HEAD's empty body under it and every later GET would read
+    an empty /rooms until the copy was replaced. Asserted on the source: the fill fetches the
+    key, a GET by construction, never the request it was handed.
+    """
+    origin = _between(
+        (EDGE / "src" / "worker.js").read_text(encoding="utf-8"),
+        "async function fromOrigin(",
+        "function fill(",
+    )
+    assert "fetch(request" not in origin, "a fill must not fetch the caller's own request"
+    assert 'new Request(key.url, { method: "GET"' in origin, (
+        "the fill must fetch a GET of the canonical key it is about to write"
+    )
+    assert origin.index("const canonical") < origin.index("await fetch("), (
+        "the canonical GET must be what is fetched, not built after the fact"
     )
