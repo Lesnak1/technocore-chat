@@ -205,6 +205,26 @@ def test_the_static_first_set_is_a_subset_of_what_is_snapshotted():
     assert set(snapshot.STATIC_FIRST) <= set(snapshot.PATHS)
 
 
+def test_the_edge_cached_lane_is_entered_only_by_a_get():
+    """A source assertion, deliberately, and narrow — there is no JS harness in this repo.
+
+    `route` admits GET and HEAD. The Cache API does not: `cache.put` rejects a request whose
+    method is not GET. So a HEAD reaching this lane throws inside `edgeCached`, unwinds to
+    the fail-open handler, and that handler fetches the origin again — two origin requests
+    for `/healthz`, which is the one path this lane exists to keep off the origin, with the
+    throw swallowed so nothing reports it. A monitor polling with HEAD would defeat the lane
+    and never know.
+
+    Guarding the lane on GET is what keeps that from happening: a HEAD falls through to the
+    origin path, which answers it in a single request.
+    """
+    worker = (EDGE / "src" / "worker.js").read_text(encoding="utf-8")
+    assert 'if (cacheFor && request.method === "GET") return edgeCached(' in worker, (
+        "the edge-cached lane must be entered only by a GET — the Cache API rejects "
+        "a non-GET request, and the throw is swallowed by the fail-open handler"
+    )
+
+
 def test_the_edge_cached_lane_shares_its_copy_only_with_the_edge():
     """A source assertion, deliberately, and narrow.
 
