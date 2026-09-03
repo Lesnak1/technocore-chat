@@ -9,10 +9,12 @@ outage the Worker exists for.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import pathlib
 import re
+import sys
 
 import _client
 import pytest
@@ -33,14 +35,18 @@ def _snapshot_module():
 
 
 def _wrangler_routes() -> set[str]:
-    """The path half of every route in wrangler.jsonc, as a URL path."""
+    """The path half of every route in wrangler.jsonc, as a URL path.
+
+    A trailing `*` is dropped: it decides *matching*, not which path is served, and every
+    caller of this helper is asking the second question.
+    """
     raw = (EDGE / "wrangler.jsonc").read_text(encoding="utf-8")
     stripped = re.sub(r"^\s*//.*$", "", raw, flags=re.M)
     config = json.loads(stripped)
     paths = set()
     for route in config["routes"]:
         _, _, path = route["pattern"].partition("/")
-        paths.add("/" + path)
+        paths.add("/" + path.rstrip("*"))
     return paths
 
 
@@ -370,3 +376,42 @@ def test_a_head_request_can_never_become_the_stored_body():
     assert origin.index("const canonical") < origin.index("await fetch("), (
         "the canonical GET must be what is fetched, not built after the fact"
     )
+
+
+def test_the_snapshot_script_needs_nothing_but_the_standard_library():
+    """deploy.sh runs it as `python3 snapshot.py`, not through uv. An import of the service's
+    own modules drags the whole dependency chain in with it and the deploy dies at the
+    snapshot step — which is the worst place for it, since wrangler then never runs and the
+    stored copies on disk are whatever the last deploy left. Restating a constant here and
+    gating it elsewhere is the trade this file makes for that.
+    """
+    tree = ast.parse((EDGE / "snapshot.py").read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):  # parsed, not grepped: prose in a docstring starts with "from"
+        if isinstance(node, ast.Import):
+            imported |= {a.name for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            imported.add(node.module)
+    external = {m.split(".")[0] for m in imported} - set(sys.stdlib_module_names) - {"__future__"}
+    assert not external, f"snapshot.py must run under a bare python3, but imports {external}"
+
+
+def test_a_path_whose_reply_varies_by_query_is_routed_with_a_wildcard():
+    """Route patterns are matched against the whole URL, query string included, so
+    `technocore.chat/rooms` matches a bare /rooms and not /rooms?format=json — the request
+    never reaches the Worker and the lane silently does nothing at all. That is how the first
+    deploy of this lane behaved: bare /rooms came back with x-edge-stamp and s-maxage=86400,
+    /rooms?format=json with the origin's own headers.
+
+    Only paths whose reply depends on the query need this, which is why the document routes
+    are exact: EDGE_KEY naming a path is what says its reply varies.
+    """
+    raw = (EDGE / "wrangler.jsonc").read_text(encoding="utf-8")
+    patterns = {
+        r["pattern"] for r in json.loads(re.sub(r"^\s*//.*$", "", raw, flags=re.M))["routes"]
+    }
+    for path in _snapshot_module().rooms_key():
+        assert f"technocore.chat{path}*" in patterns, (
+            f"{path}'s reply varies by query string, so its route must end in * or the "
+            "Worker never sees the requests that carry one"
+        )
